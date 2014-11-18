@@ -75,6 +75,10 @@ class account_asset_category(orm.Model):
             'account.account', 'Depreciation Account', required=True),
         'account_expense_depreciation_id': fields.many2one(
             'account.account', 'Depr. Expense Account', required=True),
+        'account_residual_asset_value_id': fields.many2one(
+            'account.account', 'Residual Value Account', required=True,
+            help="This account is only used if you remove an asset before "
+                 "it is fully depreciated."),
         'journal_id': fields.many2one(
             'account.journal', 'Journal', required=True),
         'company_id': fields.many2one(
@@ -813,6 +817,19 @@ class account_asset_asset(orm.Model):
             'target': 'new',
             'type': 'ir.actions.act_window',
             'context': dict(context, active_ids=ids, active_id=ids[0]),
+            'nodestroy': True,
+        }
+
+    def early_remove(self, cr, uid, ids, context=None):
+        return {
+            'name': _("Generate Asset Removal entries"),
+            'view_type': 'form',
+            'view_mode': 'form',
+            'res_model': 'account.asset.remove',
+            'target': 'new',
+            'type': 'ir.actions.act_window',
+            'context': dict(context, active_ids=ids, active_id=ids[0],
+                            early_removal=True),
             'nodestroy': True,
         }
 

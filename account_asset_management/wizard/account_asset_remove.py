@@ -23,6 +23,8 @@
 
 from openerp.osv import fields, orm
 from openerp.tools.translate import _
+from dateutil.relativedelta import relativedelta
+from datetime import datetime
 import logging
 _logger = logging.getLogger(__name__)
 
@@ -46,6 +48,10 @@ class account_asset_remove(orm.TransientModel):
         move_line_obj = self.pool.get('account.move.line')
         move_obj = self.pool.get('account.move')
         period_obj = self.pool.get('account.period')
+
+        if context.get('early_removal', False):
+            residual_value = self.prepare_early_removal(cr, uid, ids,
+                                                        context=context)
 
         wiz_data = self.browse(cr, uid, ids[0], context=context)
         asset_id = context['active_id']
@@ -83,13 +89,14 @@ class account_asset_remove(orm.TransientModel):
             }
         move_id = move_obj.create(cr, uid, move_vals, context=context)
         partner_id = asset.partner_id and asset.partner_id.id or False
+        amount = asset.asset_value - residual_value
         move_line_obj.create(cr, uid, {
             'name': asset.name,
             'ref': line_name,
             'move_id': move_id,
             'account_id': asset.category_id.account_depreciation_id.id,
-            'debit': asset.asset_value > 0 and asset.asset_value or 0.0,
-            'credit': asset.asset_value < 0 and -asset.asset_value or 0.0,
+            'debit': amount > 0 and amount or 0.0,
+            'credit': amount < 0 and -amount or 0.0,
             'period_id': period_id,
             'journal_id': journal_id,
             'partner_id': partner_id,
@@ -101,7 +108,7 @@ class account_asset_remove(orm.TransientModel):
             'ref': line_name,
             'move_id': move_id,
             'account_id': asset.category_id.account_asset_id.id,
-            'debit': asset.asset_value < 0 and -asset.asset_value or 0.0,
+            'debit': asset.asset_value < 0 and asset.asset_value or 0.0,
             'credit': asset.asset_value > 0 and asset.asset_value or 0.0,
             'period_id': period_id,
             'journal_id': journal_id,
@@ -112,16 +119,95 @@ class account_asset_remove(orm.TransientModel):
 
         # create asset line
         asset_line_vals = {
-            'amount': asset.asset_value,
+            'amount': amount,
             'asset_id': asset_id,
             'name': line_name,
             'line_date': wiz_data.date_remove,
             'move_id': move_id,
             'type': 'remove',
         }
+
+        if residual_value:
+            move_line_obj.create(cr, uid, {
+                'name': asset.name,
+                'ref': line_name,
+                'move_id': move_id,
+                'account_id': asset.category_id.\
+                              account_residual_asset_value_id.id,
+                'debit': residual_value > 0 and residual_value or 0.0,
+                'credit': residual_value < 0 and residual_value or 0.0,
+                'period_id': period_id,
+                'journal_id': journal_id,
+                'partner_id': partner_id,
+                'date': wiz_data.date_remove,
+                'asset_id': asset.id
+            }, context={'allow_asset': True})
         asset_line_obj.create(cr, uid, asset_line_vals, context=context)
         asset.write({'state': 'removed', 'date_remove': wiz_data.date_remove})
 
         return {'type': 'ir.actions.act_window_close'}
+
+    def prepare_early_removal(self, cr, uid, ids, context=None):
+        asset_obj = self.pool.get('account.asset.asset')
+        asset_line_obj = self.pool.get('account.asset.depreciation.line')
+        move_line_obj = self.pool.get('account.move.line')
+        move_obj = self.pool.get('account.move')
+        period_obj = self.pool.get('account.period')
+
+        wiz_data = self.browse(cr, uid, ids[0], context=context)
+        asset_id = context['active_id']
+        asset = asset_obj.browse(cr, uid, asset_id, context=context)
+
+        dl_ids = asset_line_obj.search(
+            cr, uid,
+            [('asset_id', '=', asset.id), ('type', '=', 'depreciate'),
+             ('init_entry', '=', False), ('move_check', '=', False)],
+            order='line_date asc')
+        first_to_depreciate_dl = asset_line_obj.browse(cr, uid, dl_ids[0])
+
+        first_date = first_to_depreciate_dl.line_date
+        if wiz_data.date_remove > first_date:
+            raise orm.except_orm(
+                _('Error!'),
+                _("You can't make an early removal if all the depreciation "
+                  "lines for previous periods are not posted."))
+
+        last_depr_date = first_to_depreciate_dl.previous_id.line_date
+        if wiz_data.date_remove < last_depr_date:
+            raise orm.except_orm(
+                _('Error!'),
+                _("The removal date must be after "
+                  "the last posted depreciation date."))
+
+        if asset.prorata: 
+            period_number_days = (datetime.strptime(first_date, '%Y-%m-%d') - \
+                datetime.strptime(last_depr_date, '%Y-%m-%d')).days
+            date_remove = datetime.strptime(wiz_data.date_remove,'%Y-%m-%d')
+            new_line_date = date_remove + relativedelta(days=-1)
+            to_depreciate_days = (new_line_date - \
+                datetime.strptime(last_depr_date, '%Y-%m-%d')).days
+            to_depreciate_amount = float(to_depreciate_days)/ \
+                float(period_number_days) * first_to_depreciate_dl.amount
+            rest_period = first_to_depreciate_dl.amount - to_depreciate_amount
+            remaining_to_depreciate_dl = asset_line_obj.browse(cr, uid,
+                                                               dl_ids[1:])
+            remaining_tot = sum([l.amount for l in remaining_to_depreciate_dl])
+            residual_value = remaining_tot + rest_period
+
+            update_vals = {
+                'amount': to_depreciate_amount,
+                'line_date': new_line_date
+            }
+            first_to_depreciate_dl.write(update_vals)
+            asset_line_obj.create_move(cr, uid, [dl_ids[0]],
+                                       context=context)
+            dl_ids.pop(0)
+        else:
+            residual_value = first_to_depreciate_dl.previous_id.remaining_value
+
+        asset_line_obj.unlink(cr, uid, dl_ids, context=context)     
+        
+
+        return residual_value
 
 # vim:expandtab:smartindent:tabstop=4:softtabstop=4:shiftwidth=4:
