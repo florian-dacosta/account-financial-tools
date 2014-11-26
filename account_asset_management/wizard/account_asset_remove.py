@@ -42,6 +42,7 @@ class account_asset_remove(orm.TransientModel):
             domain=[('state', '<>', 'done')],
             help="Keep empty to use the period of the removal ate."),
         'note': fields.text('Notes'),
+    }
 
     def remove(self, cr, uid, ids, context=None):
         asset_obj = self.pool.get('account.asset.asset')
